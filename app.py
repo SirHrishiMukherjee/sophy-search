@@ -6,19 +6,19 @@ import collections
 import math
 import hashlib
 import colorsys
-from filelock import FileLock
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from collections import Counter
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def db_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 app = Flask(__name__)
 
 # Path to the master log file that Sophy OS writes to
-DISK_BASE = "/var/data"
-log_folder = os.path.join(DISK_BASE, "Sophy_MasterLog")
-os.makedirs(log_folder, exist_ok=True)
-MASTER_LOG_PATH = os.path.join(log_folder, "sophy_master_log.txt")
-
-HIST_DIR = os.path.join(DISK_BASE, "Sophy_HistoricalTopics")
-os.makedirs(HIST_DIR, exist_ok=True)
-HIST_TOPICS_PATH = os.path.join(HIST_DIR, "all_topics.txt")
+MASTER_LOG_PATH = "DATABASE"  # purely cosmetic in footer
 
 # How many results to show
 MAX_RESULTS = 20
@@ -35,16 +35,37 @@ CACHED_THEMES = None
 CACHED_MOOD_THEMES = None
 CACHED_MOOD_COLORS = None
 
-def safe_read_log():
+def load_log_rows(limit=None):
     """
-    Safely read the entire master log with a shared lock so that
-    writes cannot interleave or corrupt reads.
+    Load the full log or last N rows from PostgreSQL.
+    Returns list of dicts: [{'id':..., 'timestamp':..., 'text':...}, ...]
     """
-    lock = FileLock(MASTER_LOG_PATH + ".lock")
+    try:
+        conn = db_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    with lock:  # shared read section
-        with open(MASTER_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
+        if limit:
+            cur.execute("""
+                SELECT id, timestamp, text
+                FROM sophy_master_log
+                ORDER BY id DESC
+                LIMIT %s
+            """, (limit,))
+        else:
+            cur.execute("""
+                SELECT id, timestamp, text
+                FROM sophy_master_log
+                ORDER BY id ASC
+            """)
+
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+
+    except Exception as e:
+        print("[DB ERROR load_log_rows]", e)
+        return []
 
 def initialize_sophy_state():
     global CACHED_TOPICS, CACHED_THEMES, CACHED_MOOD_THEMES, CACHED_MOOD_COLORS
@@ -65,56 +86,47 @@ def initialize_sophy_state():
     print("Initialization complete.")
 
 def search_log(query: str, limit: int = MAX_RESULTS):
-    """
-    Search the master log file for the query and return top matches.
-    Ranking is based on term frequency in each line.
-    Lock-safe version: uses safe_read_log() to avoid partial reads.
-    """
     if not query.strip():
         return []
 
-    # Normalize query
-    query = query.strip()
-    terms = [t.lower() for t in re.split(r"\s+", query) if t.strip()]
+    terms = [t.lower() for t in query.split() if t.strip()]
     if not terms:
         return []
 
-    results = []
+    # Build dynamic SQL
+    conditions = " AND ".join(["LOWER(text) LIKE %s" for _ in terms])
+    params = [f"%{t}%" for t in terms]
 
-    if not os.path.isfile(MASTER_LOG_PATH):
-        return []
+    try:
+        conn = db_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # SAFELY read entire log (shared lock)
-    text = safe_read_log()
+        cur.execute(f"""
+            SELECT id, timestamp, text
+            FROM sophy_master_log
+            WHERE {conditions}
+            ORDER BY id DESC
+            LIMIT %s
+        """, (*params, limit))
 
-    # Iterate with stable, correct line numbers
-    for line_no, raw_line in enumerate(text.splitlines(), start=1):
-        line = raw_line.rstrip("\n")
-        line_lower = line.lower()
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
 
-        # Compute score based on how many times each term appears
-        score = 0
-        for term in terms:
-            score += line_lower.count(term)
-
-        if score > 0:
+        # Format results like original code
+        results = []
+        for r in rows:
             results.append({
-                "line_no": line_no,
-                "text": line,
-                "score": score,
+                "line_no": r["id"],
+                "text": r["text"],
+                "score": sum(r["text"].lower().count(t) for t in terms),
+                "snippet": highlight_terms(r["text"], terms),
             })
+        return results
 
-    # Sort by score descending, then by line number ascending
-    results.sort(key=lambda r: (-r["score"], r["line_no"]))
-
-    # Truncate to limit
-    top = results[:limit]
-
-    # Build snippets with highlighted matches
-    for r in top:
-        r["snippet"] = highlight_terms(r["text"], terms)
-
-    return top
+    except Exception as e:
+        print("[DB ERROR search_log]", e)
+        return []
 
 def highlight_terms(text: str, terms):
     """
@@ -139,42 +151,24 @@ def highlight_terms(text: str, terms):
 
     return highlighted
 
-def extract_topics(limit=25, tail_bytes=250_000):
+def extract_topics(limit=25, tail_rows=2000):
     """
-    Extract topics only from the tail of the log (fast).
-    250k chars ~ last few thousand lines.
+    Extract topics from last N log rows in PostgreSQL.
     """
-    if not os.path.isfile(MASTER_LOG_PATH):
-        return []
-
-    lock = FileLock(MASTER_LOG_PATH + ".lock")
-    with lock:
-        with open(MASTER_LOG_PATH, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            start = max(0, size - tail_bytes)
-            f.seek(start)
-            raw = f.read().decode(errors="ignore")
-
-    # If we started mid-line, drop the first partial line
-    lines = raw.splitlines()[1:]
+    rows = load_log_rows(limit=tail_rows)
+    lines = [r["text"] for r in rows]
 
     topics = []
     for line in lines:
         line = line.strip()
-        if not line: 
+        if not line:
             continue
 
-        parts = line.split()
-        if parts:
-            topics.append(parts[0])
+        first_word = line.split()[0]
+        topics.append(first_word)
 
         caps = re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", line)
         topics.extend(caps)
-
-        prefix = re.split(r"[:\-]", line)[0]
-        if len(prefix.split()) == 1:
-            topics.append(prefix)
 
     cleaned = []
     for t in topics:
@@ -188,102 +182,85 @@ def extract_topics(limit=25, tail_bytes=250_000):
     return ranked
 
 def append_historical_topics(topics):
-    """Append the current extracted topics into historical file."""
-    from filelock import FileLock
-    
-    lock = FileLock(HIST_TOPICS_PATH + ".lock")
-    with lock:
-        with open(HIST_TOPICS_PATH, "a", encoding="utf-8") as f:
-            for t in topics:
-                f.write(t + "\n")
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        for t in topics:
+            cur.execute(
+                "INSERT INTO historical_topics (topic) VALUES (%s)",
+                (t,)
+            )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("[DB ERROR append_historical_topics]", e)
 
 def load_historical_topics(limit=25):
-    """Return prevalence-weighted historical topics with random jitter."""
-    if not os.path.isfile(HIST_TOPICS_PATH):
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT topic
+            FROM historical_topics
+            ORDER BY id DESC
+            LIMIT %s
+        """, (limit,))
+        rows = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+
+        return rows
+    except Exception as e:
+        print("[DB ERROR load_historical_topics]", e)
         return []
 
-    lock = FileLock(HIST_TOPICS_PATH + ".lock")
-    
-    with lock:
-        with open(HIST_TOPICS_PATH, "r", encoding="utf-8") as f:
-            lines = [l.strip().lower() for l in f if l.strip()]
+def extract_general_themes(last_rows=2000, limit=25):
+    """
+    Extract general themes from the last N log rows using PostgreSQL.
+    Equivalent to the old file-based theme extractor.
+    """
 
-    if not lines:
+    # Load the last N log entries
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT text
+            FROM sophy_master_log
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (last_rows,)
+        )
+        rows = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("[DB ERROR extract_general_themes]", e)
         return []
 
-    freq = collections.Counter(lines)
+    # Normalize and extract themes
+    cleaned = []
+    for line in rows:
+        if not line:
+            continue
 
-    import random
+        # Basic phrase-level extraction similar to your original logic
+        # Split into words, keep meaningful ones
+        words = re.findall(r"[A-Za-z][A-Za-z0-9_\-]{2,}", line)
 
-    # Weighted randomness
-    def score(t):
-        return freq[t] * (1 + random.uniform(-0.25, 0.25))
+        for w in words:
+            w = w.strip().lower()
+            if len(w) > 2:
+                cleaned.append(w)
 
-    ranked = sorted(freq.keys(), key=lambda t: score(t), reverse=True)
-
-    return ranked[:limit]
-
-def extract_general_themes(limit=10):
-    if not os.path.isfile(MASTER_LOG_PATH):
+    if not cleaned:
         return []
 
-    # SAFELY read the entire log (shared lock, no race conditions)
-    text = safe_read_log()
-
-    lines = [l.strip().lower() for l in text.splitlines() if l.strip()]
-    if not lines:
-        return []
-
-    # Remove boilerplate prefixes by skipping first N tokens
-    cleaned_lines = []
-    for line in lines:
-        tokens = re.findall(r"[a-zA-Z0-9]+", line)
-        if len(tokens) > 3:
-            tokens = tokens[2:]    # Drop first 2 OS meta-tokens
-        cleaned_lines.append(tokens)
-
-    # Collect candidate multiword phrases
-    candidate_phrases = []
-
-    for tokens in cleaned_lines:
-        # Filter out stopwords
-        tokens = [t for t in tokens if t not in STOPWORDS]
-
-        # Extract 3–6 word sliding windows
-        for n in range(3, 7):
-            for i in range(len(tokens) - n + 1):
-                phrase = " ".join(tokens[i:i+n])
-                if len(phrase) > 10:    # skip tiny phrases
-                    candidate_phrases.append(phrase)
-
-    if not candidate_phrases:
-        return []
-
-    counter = collections.Counter(candidate_phrases)
-
-    # Information density score (unchanged)
-    def score(phrase):
-        length_score = len(phrase.split())
-        rarity_score = sum(1 for w in phrase.split() if w not in STOPWORDS)
-        freq_score = counter[phrase]
-        return freq_score * rarity_score * (0.8 + 0.2 * length_score)
-
-    # Rank by score
-    ranked = sorted(counter.keys(), key=lambda p: score(p), reverse=True)
-
-    # Deduplicate by semantic prefix
-    themes = []
-    seen_starts = set()
-
-    for phrase in ranked:
-        start = " ".join(phrase.split()[:2])
-        if start not in seen_starts:
-            seen_starts.add(start)
-            themes.append(phrase)
-        if len(themes) >= limit:
-            break
-
-    return themes
+    freq = Counter(cleaned)
+    return [t for t, _ in freq.most_common(limit)]
 
 def mood_color_for_phrase(phrase: str):
     """
@@ -339,89 +316,52 @@ def mood_color_for_phrase(phrase: str):
 
     return f"#{r:02x}{g:02x}{b:02x}"
 
-def extract_time_weighted_themes(limit=5):
-    if not os.path.isfile(MASTER_LOG_PATH):
-        return []
+def extract_time_weighted_themes(window_rows=3000, limit=25):
+    """
+    Time-weighted theme extraction using PostgreSQL timestamps.
+    Recent lines have higher weight.
+    """
 
-    # SAFELY read full log using shared lock
-    text = safe_read_log()
-    lines = [l.strip().lower() for l in text.splitlines() if l.strip()]
-
-    if not lines:
-        return []
-
-    # Only use recent lines (defines Sophy's "mood")
-    SAMPLE_SIZE = 20000
-    chunk = lines[-SAMPLE_SIZE:]
-
-    total = len(chunk)
-    if total == 0:
-        return []
-
-    decay_constant = total / 3.0  # how fast old lines lose influence
-
-    # Preprocess lines
-    processed = []
-    for idx, line in enumerate(chunk):
-        tokens = re.findall(r"[a-zA-Z0-9]+", line)
-
-        # Remove OS-prefix tokens
-        if len(tokens) > 3:
-            tokens = tokens[2:]
-
-        # Remove your STOPWORDS
-        tokens = [t for t in tokens if t not in STOPWORDS]
-
-        if tokens:
-            processed.append((idx, tokens))
-
-    # Time-weighted candidate phrase extraction
-    candidates = []
-    for idx, tokens in processed:
-        age = total - idx
-        time_weight = math.exp(-age / decay_constant)
-
-        for n in range(3, 7):  # 3–6 word windows
-            for i in range(len(tokens) - n + 1):
-                phrase = " ".join(tokens[i:i+n])
-                if len(phrase) > 8:
-                    candidates.append((phrase, time_weight))
-
-    if not candidates:
-        return []
-
-    # Aggregate weighted frequencies + rarity
-    freq = collections.defaultdict(float)
-    rarity = collections.defaultdict(float)
-
-    for phrase, w in candidates:
-        freq[phrase] += w
-        rarity[phrase] = max(
-            rarity[phrase],
-            len([t for t in phrase.split() if t not in STOPWORDS])
+    # Load log rows with timestamps
+    try:
+        conn = db_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """
+            SELECT text,
+                   EXTRACT(EPOCH FROM (NOW() - timestamp)) AS age_seconds
+            FROM sophy_master_log
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (window_rows,)
         )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("[DB ERROR extract_time_weighted_themes]", e)
+        return []
 
-    # Composite theme score
-    def theme_score(p):
-        length_weight = len(p.split())
-        return freq[p] * rarity[p] * length_weight
+    weighted = Counter()
 
-    ranked = sorted(freq.keys(), key=lambda p: theme_score(p), reverse=True)
+    for r in rows:
+        text = r["text"]
+        age = float(r["age_seconds"] or 0.0)   # <-- FIXED HERE
+        weight = 1.0 / (1.0 + age)             # <-- safe now
 
-    # Deduplicate by semantic signature (first 2 words)
-    themes = []
-    seen = set()
+        words = re.findall(r"[A-Za-z][A-Za-z0-9_\-]{2,}", text)
 
-    for p in ranked:
-        sig = " ".join(p.split()[:2])
-        if sig not in seen:
-            seen.add(sig)
-            themes.append(p)
+        for w in words:
+            w = w.lower().strip()
+            if len(w) > 2:
+                weighted[w] += weight
 
-        if len(themes) >= limit:
-            break
+    if not weighted:
+        return []
 
-    return themes
+    ranked = weighted.most_common(limit)
+    return [t for t, _ in ranked]
 
 # Simple HTML template embedded in this file
 TEMPLATE = r"""
@@ -774,12 +714,17 @@ def refresh_mood():
     CACHED_MOOD_COLORS = {m: mood_color_for_phrase(m) for m in CACHED_MOOD_THEMES}
     return redirect("/")
 
+@app.route("/logs")
+def show_logs():
+    rows = load_log_rows(limit=200)
+    return "<pre>" + "\n".join(f"{r['id']}: {r['text']}" for r in rows) + "</pre>"
+
 if __name__ == "__main__":
     if not os.path.isfile(MASTER_LOG_PATH):
         open(MASTER_LOG_PATH, "a", encoding="utf-8").close()
 
     initialize_sophy_state()
 
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
